@@ -7,6 +7,8 @@ import android.os.Build;
 import android.text.TextUtils;
 import android.util.Log;
 import android.util.Pair;
+import android.view.AbsSavedState;
+import android.view.View;
 
 import com.taobao.android.dexposed.DexposedBridge;
 
@@ -22,6 +24,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.Member;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -94,14 +97,14 @@ public class ExposedBridge {
                                   final ApplicationInfo currentApplicationInfo, ClassLoader appClassLoader) {
 
         final String rootDir = new File(currentApplicationInfo.dataDir).getParent();
-//        boolean needCheck = loadModuleConfig(rootDir, currentApplicationInfo.processName);
-//
-//        if (needCheck) {
-//            if (!lastModuleList.second.contains(moduleApkPath)) {
-//                log("module:" + moduleApkPath + " is disabled, ignore");
-//                return;
-//            }
-//        }
+        boolean needCheck = loadModuleConfig(rootDir, currentApplicationInfo.processName);
+
+        if (needCheck) {
+            if (!lastModuleList.second.contains(moduleApkPath)) {
+                log("module:" + moduleApkPath + " is disabled, ignore");
+                return;
+            }
+        }
 
         log("Loading modules from " + moduleApkPath);
 
@@ -199,6 +202,8 @@ public class ExposedBridge {
             return;
         }
 
+        Log.i(TAG, "initForXposedInstaller");
+
         // XposedInstaller
         final int fakeXposedVersion = 88;
         final File xposedProp = context.getFileStreamPath("xposed_prop");
@@ -246,10 +251,9 @@ public class ExposedBridge {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
                 super.beforeHookedMethod(param);
-                final Object path = param.args[0];
-                if (BASE_DIR.equals(path)) {
-                    log("found xposed base dir, redirect");
-                    param.args[0] = dataDir;
+                final String path = (String)param.args[0];
+                if (path.startsWith(BASE_DIR)) {
+                    param.args[0] = path.replace(BASE_DIR, path.equals(BASE_DIR) ? dataDir : dataDir + "/exposed_");
                 }
             }
         });
@@ -257,11 +261,23 @@ public class ExposedBridge {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
                 super.beforeHookedMethod(param);
-                final Object path = param.args[0];
-                if (BASE_DIR.equals(path)) {
-                    log("found xposed base dir, redirect");
-                    param.args[0] = dataDir;
+                final String path = (String)param.args[0];
+                if (path.startsWith(BASE_DIR)) {
+                    param.args[0] = path.replace(BASE_DIR, path.equals(BASE_DIR) ? dataDir : dataDir + "/exposed_");
                 }
+            }
+        });
+
+        // fix bug on Android O: https://github.com/emilsjolander/StickyListHeaders/issues/477
+        Class<?> stickyListHeadersClass = XposedHelpers.findClass("se.emilsjolander.stickylistheaders.StickyListHeadersListView", appClassLoader);
+        DexposedBridge.findAndHookMethod(stickyListHeadersClass, "onSaveInstanceState", new com.taobao.android.dexposed.XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                super.beforeHookedMethod(param);
+                param.setResult(AbsSavedState.EMPTY_STATE);
+                Field mPrivateFlags = XposedHelpers.findField(View.class, "mPrivateFlags");
+                int flags = mPrivateFlags.getInt(param.thisObject);
+                mPrivateFlags.set(param.thisObject, flags | 0x00020000);
             }
         });
     }
@@ -284,7 +300,7 @@ public class ExposedBridge {
             return false; // xposed installer not enabled, must load all.
         }
 
-        final File modiles = new File(xposedInstallerDir, "conf/modules.list");
+        final File modiles = new File(xposedInstallerDir, "exposed_conf/modules.list");
         if (!modiles.exists()) {
             Log.d(TAG, "xposed installer's modules not exist, ignore.");
             return false; // xposed installer config file not exist, load all.
@@ -331,7 +347,7 @@ public class ExposedBridge {
 
         Set<String> modileSet = new HashSet<>();
 
-        final File modules = new File(xposedInstallerDir, "conf/modules.list");
+        final File modules = new File(xposedInstallerDir, "exposed_conf/modules.list");
         BufferedReader br = null;
         try {
             br = new BufferedReader(new FileReader(modules));
