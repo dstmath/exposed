@@ -1,20 +1,20 @@
 package me.weishu.exposed;
 
 import android.annotation.SuppressLint;
-import android.app.Activity;
-import android.app.Fragment;
+import android.content.ComponentName;
 import android.content.Context;
+import android.content.Intent;
+import android.content.ServiceConnection;
 import android.content.pm.ApplicationInfo;
 import android.os.Build;
+import android.os.IBinder;
 import android.text.TextUtils;
 import android.util.Log;
 import android.util.Pair;
 import android.view.AbsSavedState;
 import android.view.View;
-import android.widget.Toast;
 
 import com.getkeepsafe.relinker.ReLinker;
-import com.taobao.android.dexposed.DexposedBridge;
 
 import java.io.BufferedReader;
 import java.io.Closeable;
@@ -29,24 +29,27 @@ import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Member;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import dalvik.system.DexClassLoader;
+import de.robv.android.xposed.DexposedBridge;
 import de.robv.android.xposed.ExposedHelper;
 import de.robv.android.xposed.IXposedHookInitPackageResources;
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.IXposedHookZygoteInit;
 import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XSharedPreferences;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-import static com.taobao.android.dexposed.DexposedBridge.log;
+import static de.robv.android.xposed.XposedBridge.log;
 
 
 public class ExposedBridge {
@@ -67,6 +70,14 @@ public class ExposedBridge {
     private static Map<ClassLoader, ClassLoader> exposedClassLoaderMap = new HashMap<>();
     private static ClassLoader xposedClassLoader;
 
+    private static Context appContext;
+    private static ModuleLoadListener sModuleLoadListener = new ModuleLoadListener() {
+        @Override
+        public void onModuleLoaded(String moduleName, ApplicationInfo applicationInfo, ClassLoader appClassLoader) {
+            // initForWeChatTranslate(moduleName, applicationInfo, appClassLoader);
+        }
+    };
+
     /**
      * Module load result
      */
@@ -79,8 +90,11 @@ public class ExposedBridge {
     }
 
     public static void initOnce(Context context, ApplicationInfo applicationInfo, ClassLoader appClassLoader) {
+        appContext = context;
         ReLinker.loadLibrary(context, "epic");
         ExposedHelper.initSeLinux(applicationInfo.processName);
+        XSharedPreferences.setPackageBaseDirectory(new File(applicationInfo.dataDir).getParentFile());
+
         initForXposedInstaller(context, applicationInfo, appClassLoader);
     }
 
@@ -183,6 +197,8 @@ public class ExposedBridge {
                         // TODO: 17/12/1 Support Resource hook
                     }
 
+                    sModuleLoadListener.onModuleLoaded(moduleClassName, currentApplicationInfo, mcl);
+
                     return ModuleLoadResult.SUCCESS;
                 } catch (Throwable t) {
                     log(t);
@@ -200,7 +216,7 @@ public class ExposedBridge {
     }
 
     public static XC_MethodHook.Unhook hookMethod(Member method, XC_MethodHook callback) {
-        final com.taobao.android.dexposed.XC_MethodHook.Unhook unhook = DexposedBridge.hookMethod(method, new XC_MethodHookX2Dx(callback));
+        final XC_MethodHook.Unhook unhook = DexposedBridge.hookMethod(method, callback);
         return ExposedHelper.newUnHook(callback, unhook.getHookedMethod());
     }
 
@@ -213,7 +229,7 @@ public class ExposedBridge {
         Log.i(TAG, "initForXposedInstaller");
 
         // XposedInstaller
-        final int fakeXposedVersion = 89;
+        final int fakeXposedVersion = 91;
         final String fakeVersionString = String.valueOf(fakeXposedVersion);
         final File xposedProp = context.getFileStreamPath("xposed_prop");
         if (!xposedProp.exists()) {
@@ -236,16 +252,16 @@ public class ExposedBridge {
             Array.set(xposed_prop_files, i, xposedPropPath);
         }
 
-        DexposedBridge.findAndHookMethod(xposedApp, "getActiveXposedVersion", new com.taobao.android.dexposed.XC_MethodHook() {
+        DexposedBridge.findAndHookMethod(xposedApp, "getActiveXposedVersion", new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
                 super.beforeHookedMethod(param);
                 param.setResult(fakeXposedVersion);
             }
         });
-        DexposedBridge.findAndHookMethod(xposedApp, "getInstalledXposedVersion", new com.taobao.android.dexposed.XC_MethodHook() {
+        DexposedBridge.findAndHookMethod(xposedApp, "getInstalledXposedVersion", new XC_MethodHook() {
             @Override
-            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+            protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) throws Throwable {
                 super.beforeHookedMethod(param);
                 param.setResult(fakeXposedVersion);
             }
@@ -254,7 +270,7 @@ public class ExposedBridge {
         final Constructor<?> fileConstructor1 = XposedHelpers.findConstructorExact(File.class, String.class);
         final Constructor<?> fileConstructor2 = XposedHelpers.findConstructorExact(File.class, String.class, String.class);
         final String dataDir = applicationInfo.dataDir;
-        DexposedBridge.hookMethod(fileConstructor1, new com.taobao.android.dexposed.XC_MethodHook() {
+        DexposedBridge.hookMethod(fileConstructor1, new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
                 super.beforeHookedMethod(param);
@@ -264,7 +280,7 @@ public class ExposedBridge {
                 }
             }
         });
-        DexposedBridge.hookMethod(fileConstructor2, new com.taobao.android.dexposed.XC_MethodHook() {
+        DexposedBridge.hookMethod(fileConstructor2, new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
                 super.beforeHookedMethod(param);
@@ -277,7 +293,7 @@ public class ExposedBridge {
 
         // fix bug on Android O: https://github.com/emilsjolander/StickyListHeaders/issues/477
         Class<?> stickyListHeadersClass = XposedHelpers.findClass("se.emilsjolander.stickylistheaders.StickyListHeadersListView", appClassLoader);
-        DexposedBridge.findAndHookMethod(stickyListHeadersClass, "onSaveInstanceState", new com.taobao.android.dexposed.XC_MethodHook() {
+        DexposedBridge.findAndHookMethod(stickyListHeadersClass, "onSaveInstanceState", new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
                 super.beforeHookedMethod(param);
@@ -287,29 +303,109 @@ public class ExposedBridge {
                 mPrivateFlags.set(param.thisObject, flags | 0x00020000);
             }
         });
+    }
 
-        // make the module reload when enter ModuleFragment
-        DexposedBridge.findAndHookMethod(Fragment.class, "onResume", new com.taobao.android.dexposed.XC_MethodHook() {
+
+    private static void initForWeChatTranslate(String moduleClassName, ApplicationInfo applicationInfo, ClassLoader appClassLoader) {
+        if (!"com.hkdrjxy.wechart.xposed.XposedInit".equals(moduleClassName)) {
+            return;
+        }
+
+        if (!("com.hiwechart.translate".equals(applicationInfo.processName) || "com.tencent.mm".equals(applicationInfo.processName))) {
+            return;
+        }
+
+        final IBinder[] translateService = new IBinder[1];
+        Intent intent = new Intent();
+        intent.setAction("com.hiwechart.translate.aidl.TranslateService");
+        ComponentName v2 = new ComponentName("com.hiwechart.translate", "com.hiwechart.translate.aidl.TranslateService");
+        intent.setComponent(v2);
+        appContext.bindService(intent, new ServiceConnection() {
             @Override
-            protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                super.afterHookedMethod(param);
-                Fragment fragment = (Fragment) param.thisObject;
-                if ("de.robv.android.xposed.installer.ModulesFragment".equals(fragment.getClass().getName())) {
-                    // ModulesFragment, call reload
-                    Class<?> moduleUtilClass = fragment.getClass().getClassLoader().loadClass("de.robv.android.xposed.installer.util.ModuleUtil");
-                    Object moduleUtil = XposedHelpers.callStaticMethod(moduleUtilClass, "getInstance");
-                    XposedHelpers.callMethod(moduleUtil, "reloadInstalledModules");
-                    Activity activity = fragment.getActivity();
-                    log("module fragment reload success, activity:" + activity);
-                    if (activity != null) {
-                        String tips = Locale.getDefault().toString().contains("zh") ? "勾选模块之后，需要在主界面右上角按钮 -> 重启 才能生效哦～" :
-                                "module will take effect after Settings->Reboot!";
-                        Toast.makeText(activity, tips, Toast.LENGTH_SHORT).show();
-                    }
+            public void onServiceConnected(ComponentName name, IBinder service) {
+                Log.i("mylog", "onServiceConnected: " + service);
+                translateService[0] = service;
+            }
+
+            @Override
+            public void onServiceDisconnected(ComponentName name) {
+
+            }
+        }, Context.BIND_AUTO_CREATE);
+
+        Class<?> serviceManager = XposedHelpers.findClass("android.os.ServiceManager", appClassLoader);
+        final String serviceName = Build.VERSION.SDK_INT >= 21 ? "user.wechart.trans" : "wechart.trans";
+        DexposedBridge.findAndHookMethod(serviceManager, "getService", String.class, new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                super.beforeHookedMethod(param);
+                if (serviceName.equals(param.args[0])) {
+                    Log.i("mylog", "get service :" + translateService[0]);
+                    param.setResult(translateService[0]);
                 }
             }
         });
+
+        try {
+            Class<?> okHttpClient = XposedHelpers.findClass("okhttp3.OkHttpClient", appClassLoader);
+            DexposedBridge.findAndHookMethod(okHttpClient, "newBuilder", new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                    super.afterHookedMethod(param);
+                    Log.i("mylog", "OkHttpClient.newBuilder before:");
+                }
+
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                    super.afterHookedMethod(param);
+                    Log.i("mylog", "OkHttpClient.newBuilder after:" + param.getResult());
+                }
+            });
+
+            Class<?> DevicesLocation = XposedHelpers.findClass("okhttp3.OkHttpClient$Builder", appClassLoader);
+            DexposedBridge.hookAllConstructors(DevicesLocation, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                    super.beforeHookedMethod(param);
+                    Log.i("mylog", "OkHttpClient$Builder:" + Arrays.toString(param.args), new RuntimeException("stack"));
+                }
+            });
+
+            DexposedBridge.findAndHookMethod(DevicesLocation, "checkDuration", String.class, long.class, TimeUnit.class, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                    super.beforeHookedMethod(param);
+                    Log.i("mylog", "checkDuration:" + Arrays.toString(param.args));
+                }
+            });
+
+            DexposedBridge.findAndHookMethod(DevicesLocation, "connectTimeout", long.class, TimeUnit.class, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                    super.afterHookedMethod(param);
+                    Log.i("mylog", "connectTimeout, this: " + param.thisObject + ", args:" + Arrays.toString(param.args) + ", result:" + param.getResult());
+                }
+            });
+        } catch (Throwable e) {
+            Log.e("mylog", "classLoader eror", e);
+        }
     }
+
+//    private static void initForWeChatTranslate(final Context context, ApplicationInfo applicationInfo, ClassLoader appClassLoader) {
+//        if (!"".equals(applicationInfo.packageName)) {
+//            return;
+//        }
+//        DexposedBridge.findAndHookMethod(Environment.class, "getExternalStorageDirectory", new com.taobao.android.dexposed.XC_MethodHook() {
+//            @Override
+//            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+//                super.beforeHookedMethod(param);
+//                File f = context.getFilesDir();
+//                param.setResult(f);
+//            }
+//        });
+//
+//    }
+
 
     /**
      * write xposed property file to fake xposedinstaller
