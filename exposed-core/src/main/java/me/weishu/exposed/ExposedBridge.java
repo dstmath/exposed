@@ -64,16 +64,27 @@ public class ExposedBridge {
     public static final String BASE_DIR = Build.VERSION.SDK_INT >= 24
             ? "/data/user_de/0/de.robv.android.xposed.installer/" : BASE_DIR_LEGACY;
 
+    private static final int FAKE_XPOSED_VERSION = 91;
     private static final String VERSION_KEY = "version";
+    private static boolean SYSTEM_CLASSLOADER_INJECT = false;
+
+    private static final String WECHAT_PACKAGE = "com.tencent.mm";
 
     private static Pair<String, Set<String>> lastModuleList = Pair.create(null, null);
     private static Map<ClassLoader, ClassLoader> exposedClassLoaderMap = new HashMap<>();
     private static ClassLoader xposedClassLoader;
 
-    private static volatile boolean isWxposed = false;
+    private static volatile boolean isWeChat = false;
 
     private static Context appContext;
     private static ModuleLoadListener sModuleLoadListener = new ModuleLoadListener() {
+        @Override
+        public void onLoadingModule(String moduleClassName, ApplicationInfo applicationInfo, ClassLoader appClassLoader) {
+            if (WECHAT_PACKAGE.equalsIgnoreCase(applicationInfo.packageName)) {
+                isWeChat = true;
+            }
+        }
+
         @Override
         public void onModuleLoaded(String moduleName, ApplicationInfo applicationInfo, ClassLoader appClassLoader) {
             initForWeChatTranslate(moduleName, applicationInfo, appClassLoader);
@@ -88,10 +99,13 @@ public class ExposedBridge {
         NOT_EXIST,
         INVALID,
         SUCCESS,
-        FAILED
+        FAILED,
+        IGNORED
     }
 
     public static void initOnce(Context context, ApplicationInfo applicationInfo, ClassLoader appClassLoader) {
+        // SYSTEM_CLASSLOADER_INJECT = patchSystemClassLoader();
+        XposedBridge.XPOSED_BRIDGE_VERSION = FAKE_XPOSED_VERSION;
         appContext = context;
         ReLinker.loadLibrary(context, "epic");
         ExposedHelper.initSeLinux(applicationInfo.processName);
@@ -101,15 +115,32 @@ public class ExposedBridge {
         initForXposedInstaller(context, applicationInfo, appClassLoader);
     }
 
-    public static void patchAppClassLoader(Context baseContext) {
-        final ClassLoader originClassLoader = baseContext.getClassLoader();
-        Object mPackageInfo = XposedHelpers.getObjectField(baseContext, "mPackageInfo");
-        ClassLoader appClassLoaderWithXposed = getAppClassLoaderWithXposed(originClassLoader);
-        XposedHelpers.setObjectField(mPackageInfo, "mClassLoader", appClassLoaderWithXposed);
-        Thread.currentThread().setContextClassLoader(appClassLoaderWithXposed);
+    private static boolean patchSystemClassLoader() {
+        // 1. first create XposedClassLoader -> BootstrapClassLoader
+        ClassLoader xposedClassLoader = new XposedClassLoader(ExposedBridge.class.getClassLoader());
+
+        // 2. replace the systemclassloader's parent.
+        ClassLoader systemClassLoader = ClassLoader.getSystemClassLoader();
+
+        try {
+            Field parent = ClassLoader.class.getDeclaredField("parent");
+            parent.setAccessible(true);
+            parent.set(systemClassLoader, xposedClassLoader);
+
+            log("XposedBridge's BootClassLoader: " + XposedBridge.BOOTCLASSLOADER + ", parent: " + XposedBridge.BOOTCLASSLOADER.getParent());
+            // SystemClassLoader -> XposedClassLoader -> BootstrapClassLoader
+            return systemClassLoader.getParent() == xposedClassLoader;
+        } catch (NoSuchFieldException e) {
+            // todo no such field ? use unsafe.
+            log(e);
+            return false;
+        } catch (IllegalAccessException e) {
+            log(e);
+            return false;
+        }
     }
 
-    public static synchronized ClassLoader getAppClassLoaderWithXposed(ClassLoader appClassLoader) {
+    private static synchronized ClassLoader getAppClassLoaderWithXposed(ClassLoader appClassLoader) {
         if (exposedClassLoaderMap.containsKey(appClassLoader)) {
             return exposedClassLoaderMap.get(appClassLoader);
         } else {
@@ -131,6 +162,10 @@ public class ExposedBridge {
     public static ModuleLoadResult loadModule(final String moduleApkPath, String moduleOdexDir, String moduleLibPath,
                                   final ApplicationInfo currentApplicationInfo, ClassLoader appClassLoader) {
 
+        if (isXposedInstaller(currentApplicationInfo)) {
+            return ModuleLoadResult.IGNORED;
+        }
+
         final String rootDir = new File(currentApplicationInfo.dataDir).getParent();
         loadModuleConfig(rootDir, currentApplicationInfo.processName);
 
@@ -139,18 +174,26 @@ public class ExposedBridge {
             return ModuleLoadResult.DISABLED;
         }
 
-        log("Loading modules from " + moduleApkPath + " for process: " + currentApplicationInfo.processName);
+        log("Loading modules from " + moduleApkPath + " for process: " + currentApplicationInfo.processName + " i s c: " + SYSTEM_CLASSLOADER_INJECT);
 
         if (!new File(moduleApkPath).exists()) {
             log(moduleApkPath + " does not exist");
             return ModuleLoadResult.NOT_EXIST;
         }
 
-        ClassLoader hostClassLoader = ExposedBridge.class.getClassLoader();
-        ClassLoader appClassLoaderWithXposed = getAppClassLoaderWithXposed(appClassLoader);
-
-        ClassLoader mcl = new DexClassLoader(moduleApkPath, moduleOdexDir, moduleLibPath, getXposedClassLoader(hostClassLoader));
-        // ClassLoader mcl = new DexClassLoader(moduleApkPath, moduleOdexDir, moduleLibPath, hostClassLoader);
+        ClassLoader appClassLoaderWithXposed;
+        ClassLoader mcl;
+        if (SYSTEM_CLASSLOADER_INJECT) {
+            // we replace the systemclassloader's parent success, go with xposed's way
+            appClassLoaderWithXposed = appClassLoader;
+            mcl = new DexClassLoader(moduleApkPath, moduleOdexDir, moduleLibPath, XposedBridge.BOOTCLASSLOADER);
+        } else {
+            // replace failed, just wrap.
+            ClassLoader hostClassLoader = ExposedBridge.class.getClassLoader();
+            appClassLoaderWithXposed = getAppClassLoaderWithXposed(appClassLoader);
+            mcl = new DexClassLoader(moduleApkPath, moduleOdexDir, moduleLibPath, getXposedClassLoader(hostClassLoader));
+            // ClassLoader mcl = new DexClassLoader(moduleApkPath, moduleOdexDir, moduleLibPath, hostClassLoader);
+        }
 
         InputStream is = mcl.getResourceAsStream("assets/xposed_init");
         if (is == null) {
@@ -170,9 +213,7 @@ public class ExposedBridge {
                     log("  Loading class " + moduleClassName);
                     Class<?> moduleClass = mcl.loadClass(moduleClassName);
 
-                    if ("com.fkzhang.wechatxposed.XposedInit".equalsIgnoreCase(moduleClassName)) {
-                        isWxposed = true;
-                    }
+                    sModuleLoadListener.onLoadingModule(moduleClassName, currentApplicationInfo, mcl);
 
                     if (!ExposedHelper.isIXposedMod(moduleClass)) {
                         log("    This class doesn't implement any sub-interface of IXposedMod, skipping it");
@@ -216,23 +257,24 @@ public class ExposedBridge {
         } catch (IOException e) {
             log(e);
         } finally {
-            try {
-                is.close();
-            } catch (IOException ignored) {
-            }
+            closeSliently(is);
         }
         return ModuleLoadResult.FAILED;
     }
 
     private static boolean ignoreHooks(Member member) {
-        if (isWxposed) {
+        if (isWeChat) {
             if (member instanceof Method) {
                 if (((Method) member).getReturnType() == Bitmap.class) {
-                    log("ignore hook: " + ((Method) member).toGenericString());
+                    log("i h: " + ((Method) member).toGenericString());
                     return true;
                 }
                 if ("closeChatting".equalsIgnoreCase(member.getName())) {
-                    log("ignore hook: " + ((Method) member).toGenericString());
+                    log("i h: " + ((Method) member).toGenericString());
+                    return true;
+                }
+                if (member.getDeclaringClass().getName().contains("notification")) {
+                    log("i h: " + ((Method) member).toGenericString());
                     return true;
                 }
             }
@@ -261,16 +303,17 @@ public class ExposedBridge {
         }
     }
 
+    private static boolean isXposedInstaller(ApplicationInfo applicationInfo) {
+        return XPOSED_INSTALL_PACKAGE.equals(applicationInfo.packageName);
+    }
+
     private static void initForXposedInstaller(Context context, ApplicationInfo applicationInfo, ClassLoader appClassLoader) {
-        if (!XPOSED_INSTALL_PACKAGE.equals(applicationInfo.packageName)) {
+        if (!isXposedInstaller(applicationInfo)) {
             return;
         }
 
-        Log.i(TAG, "initForXposedInstaller");
-
         // XposedInstaller
-        final int fakeXposedVersion = 91;
-        final String fakeVersionString = String.valueOf(fakeXposedVersion);
+        final String fakeVersionString = String.valueOf(FAKE_XPOSED_VERSION);
         final File xposedProp = context.getFileStreamPath("xposed_prop");
         if (!xposedProp.exists()) {
             writeXposedProperty(xposedProp, fakeVersionString, false);
@@ -296,14 +339,14 @@ public class ExposedBridge {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
                 super.beforeHookedMethod(param);
-                param.setResult(fakeXposedVersion);
+                param.setResult(FAKE_XPOSED_VERSION);
             }
         });
         DexposedBridge.findAndHookMethod(xposedApp, "getInstalledXposedVersion", new XC_MethodHook() {
             @Override
             protected void beforeHookedMethod(XC_MethodHook.MethodHookParam param) throws Throwable {
                 super.beforeHookedMethod(param);
-                param.setResult(fakeXposedVersion);
+                param.setResult(FAKE_XPOSED_VERSION);
             }
         });
 
